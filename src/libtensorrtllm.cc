@@ -824,7 +824,20 @@ public:
 
                         if (markedInProgress)
                         {
-                            rval.emplace_back(workItem->getInferenceRequest());
+                            bool is_cancelled = false;
+                            TRITONBACKEND_ResponseFactoryIsCancelled(workItem->response_factory(), &is_cancelled);
+
+                            if (is_cancelled)
+                            {
+                                std::string warnStr = std::string("request Id ") + std::to_string(workItem->requestId())
+                                    + std::string(" is cancelled on Triton. Request is ignored.");
+                                TLLM_LOG_WARNING(warnStr);
+                                sendTritonResponse(workItem, {}, true, warnStr);
+                            }
+                            else
+                            {
+                                rval.emplace_back(workItem->getInferenceRequest());
+                            }
                             count++;
                         }
                         else
@@ -895,10 +908,17 @@ public:
         TRITONSERVER_Error* err = nullptr;
         if (!errMsg.empty())
         {
-            std::string errStr = "Encountered error for requestId " + std::to_string(requestId) + ": " + errMsg;
-            TLLM_LOG_ERROR(errStr);
+            if (errMsg.find("cancelled on Triton") != std::string::npos)
+            {
+                err = TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_CANCELLED, errMsg.c_str());
+            }
+            else
+            {
+                std::string errStr = "Encountered error for requestId " + std::to_string(requestId) + ": " + errMsg;
+                TLLM_LOG_ERROR(errStr);
 
-            err = TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_INTERNAL, errStr.c_str());
+                err = TRITONSERVER_ErrorNew(TRITONSERVER_ERROR_INTERNAL, errStr.c_str());
+            }
             final_response = true;
         }
         else
