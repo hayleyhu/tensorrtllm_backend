@@ -10,3 +10,9 @@ build/
 *.csv
 *.onnx
 tmp/
+.idea/.gitignore
+.idea/modules.xml
+.idea/tensorrtllm_backend.iml
+.idea/vcs.xml
+.idea/codeStyles/codeStyleConfig.xml
+.idea/codeStyles/Project.xml
