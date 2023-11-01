@@ -87,7 +87,7 @@ class TritonPythonModel:
 
         responses = []
 
-        # Every Python backend must iterate over everyone of the requests
+    # Every Python backend must iterate over everyone of the requests
         # and create a pb_utils.InferenceResponse for each of them.
         for idx, request in enumerate(requests):
             # Get input tensors

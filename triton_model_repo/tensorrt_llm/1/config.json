@@ -4,11 +4,11 @@
     "hidden_act": "silu",
     "hidden_size": 8192,
     "int8": false,
-    "max_batch_size": 64,
+    "max_batch_size": 32,
     "max_input_len": 4096,
     "max_num_tokens": null,
     "max_output_len": 120,
-    "max_position_embeddings": 2048,
+    "max_position_embeddings": 4096,
     "name": "llama",
     "num_heads": 64,
     "num_kv_heads": 8,
@@ -16,8 +16,8 @@
     "parallel_build": true,
     "pipeline_parallel": 1,
     "precision": "float16",
-    "quant_mode": 0,
-    "tensor_parallel": 4,
+    "quant_mode": 66,
+    "tensor_parallel": 2,
     "use_refit": false,
     "vocab_size": 32000
   },
@@ -42,6 +42,6 @@
     "tokens_per_block": 128,
     "use_custom_all_reduce": false,
     "weight_only_groupwise_quant_matmul_plugin": false,
-    "weight_only_quant_matmul_plugin": false
+    "weight_only_quant_matmul_plugin": "float16"
   }
 }
