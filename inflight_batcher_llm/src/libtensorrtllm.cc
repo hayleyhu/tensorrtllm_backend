@@ -136,7 +136,7 @@ nvinfer1::DataType to_trt_datatype(TRITONSERVER_DataType data_type)
     }
     else if (data_type == TRITONSERVER_TYPE_UINT64)
     {
-        return nvinfer1::DataType::kINT64;
+        return nvinfer1::DataType::kINT32;
     }
     else if (data_type == TRITONSERVER_TYPE_INT8)
     {
@@ -152,11 +152,11 @@ nvinfer1::DataType to_trt_datatype(TRITONSERVER_DataType data_type)
     }
     else if (data_type == TRITONSERVER_TYPE_INT64)
     {
-        return nvinfer1::DataType::kINT64;
+        return nvinfer1::DataType::kINT32;
     }
     else if (data_type == TRITONSERVER_TYPE_FP16)
     {
-        return nvinfer1::DataType::kBF16;
+        return nvinfer1::DataType::kFP8;
     }
     else if (data_type == TRITONSERVER_TYPE_FP32)
     {
@@ -172,7 +172,7 @@ nvinfer1::DataType to_trt_datatype(TRITONSERVER_DataType data_type)
     }
     else if (data_type == TRITONSERVER_TYPE_BF16)
     {
-        return nvinfer1::DataType::kBF16;
+        return nvinfer1::DataType::kFP8;
     }
     else
     {
@@ -203,7 +203,7 @@ TRITONSERVER_DataType to_triton_datatype(nvinfer1::DataType data_type)
     {
         return TRITONSERVER_TYPE_INT32;
     }
-    else if (data_type == nvinfer1::DataType::kINT64)
+    else if (data_type == nvinfer1::DataType::kINT32)
     {
         return TRITONSERVER_TYPE_INT64;
     }
@@ -211,7 +211,7 @@ TRITONSERVER_DataType to_triton_datatype(nvinfer1::DataType data_type)
     {
         return TRITONSERVER_TYPE_FP32;
     }
-    else if (data_type == nvinfer1::DataType::kBF16)
+    else if (data_type == nvinfer1::DataType::kFP8)
     {
         return TRITONSERVER_TYPE_BF16;
     }

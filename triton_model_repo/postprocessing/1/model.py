@@ -132,7 +132,11 @@ class TritonPythonModel:
     def _postprocessing(self, tokens_batch):
         outputs = []
         for beam_tokens in tokens_batch:
-            for tokens in beam_tokens:
-                output = self.tokenizer.decode(tokens)
-                outputs.append(output.encode('utf8'))
+            for id in beam_tokens:
+                # print("postprocess id:", id)
+                output = self.tokenizer.decode(id)
+                token = self.tokenizer.convert_ids_to_tokens(id)[0]
+                if token.startswith("▁"):
+                    output = ' ' + output
+                outputs.append(output.encode('utf-8'))
         return outputs

@@ -170,6 +170,7 @@ class TritonPythonModel:
         start_ids = pad_sequence(start_ids,
                                  batch_first=True,
                                  padding_value=self.pad_id)
+        # print("preprocess start_id:", start_ids)
         # input_len = min(start_lengths)
         #attn_mask = torch.ones((batch_size, input_len, input_len)).tril()
 
