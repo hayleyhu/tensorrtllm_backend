@@ -57,6 +57,11 @@ class TritonPythonModel:
             'string_value']
         tokenizer_type = model_config['parameters']['tokenizer_type'][
             'string_value']
+        self.skip_special_tokens = model_config['parameters'].get(
+            'skip_special_tokens',
+            {'string_value': "true"})['string_value'].lower() in [
+                'true', '1', 't', 'y', 'yes'
+            ]
 
         if tokenizer_type == 't5':
             self.tokenizer = T5Tokenizer(vocab_file=tokenizer_dir,
@@ -113,6 +118,14 @@ class TritonPythonModel:
             sequence_lengths = pb_utils.get_input_tensor_by_name(
                 request, 'SEQUENCE_LENGTH').as_numpy()
 
+            # Get cum log probs
+            cum_log_probs = pb_utils.get_input_tensor_by_name(
+                request, 'CUM_LOG_PROBS').as_numpy()
+
+            # Get sequence length
+            output_log_probs = pb_utils.get_input_tensor_by_name(
+                request, 'OUTPUT_LOG_PROBS').as_numpy()
+
             # Reshape Input
             # tokens_batch = tokens_batch.reshape([-1, tokens_batch.shape[0]])
             # tokens_batch = tokens_batch.T
@@ -126,6 +139,12 @@ class TritonPythonModel:
                 'OUTPUT',
                 np.array(outputs).astype(self.output_dtype))
 
+            out_cum_log_probs = pb_utils.Tensor('OUT_CUM_LOG_PROBS',
+                                                cum_log_probs)
+
+            out_output_log_probs = pb_utils.Tensor('OUT_OUTPUT_LOG_PROBS',
+                                                   output_log_probs)
+
             # Create InferenceResponse. You can set an error here in case
             # there was a problem with handling this inference request.
             # Below is an example of how you can set errors in inference
@@ -133,8 +152,9 @@ class TritonPythonModel:
             #
             # pb_utils.InferenceResponse(
             #    output_tensors=..., TritonError("An error occurred"))
-            inference_response = pb_utils.InferenceResponse(
-                output_tensors=[output_tensor])
+            inference_response = pb_utils.InferenceResponse(output_tensors=[
+                output_tensor, out_cum_log_probs, out_output_log_probs
+            ])
             responses.append(inference_response)
 
         # You should return a list of pb_utils.InferenceResponse. Length
@@ -153,6 +173,8 @@ class TritonPythonModel:
         for batch_idx, beam_tokens in enumerate(tokens_batch):
             for beam_idx, tokens in enumerate(beam_tokens):
                 seq_len = sequence_lengths[batch_idx][beam_idx]
-                output = self.tokenizer.decode(tokens[:seq_len])
+                output = self.tokenizer.decode(
+                    tokens[:seq_len],
+                    skip_special_tokens=self.skip_special_tokens)
                 outputs.append(output.encode('utf8'))
         return outputs

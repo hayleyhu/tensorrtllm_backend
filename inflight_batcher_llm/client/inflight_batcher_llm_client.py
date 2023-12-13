@@ -26,6 +26,8 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import argparse
+import csv
+import os
 import queue
 import sys
 import time
@@ -33,7 +35,6 @@ from functools import partial
 
 import numpy as np
 import tritonclient.grpc as grpcclient
-import tritonclient.http as httpclient
 from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
 from tritonclient.utils import InferenceServerException, np_to_triton_dtype
 
@@ -58,6 +59,40 @@ from tritonclient.utils import InferenceServerException, np_to_triton_dtype
 # tensorrt_llm/cpp/tests/resources/models/rt_engine/gpt2/fp16-inflight-batching-plugin/1-gpu/
 #
 
+np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
+
+_str_to_np_dict = dict(
+    float16=np.float16,
+    float32=np.float32,
+    int32=np.int32,
+    bfloat16=np_bfloat16,
+)
+
+
+def curate_log_output(token_sequence,
+                      identifier="Input",
+                      log_max_sequence_len=256):
+    if len(token_sequence) > log_max_sequence_len:
+        print(f"{identifier} sequence starts with: ",
+              token_sequence[:log_max_sequence_len])
+    else:
+        print(f"{identifier} sequence: ", token_sequence)
+
+
+def str_dtype_to_np(dtype):
+    ret = _str_to_np_dict.get(dtype)
+    assert ret is not None, f'Unsupported dtype: {dtype}'
+    return ret
+
+
+def check_output_names(expected_outputs, infer_result):
+    if expected_outputs:
+        output_names = set([o.name for o in infer_result._result.outputs])
+        if set(expected_outputs) != output_names:
+            raise Exception(
+                f"expected outputs do not match actual outputs {expected_outputs} != {output_names}"
+            )
+
 
 class UserData:
 
@@ -65,30 +100,58 @@ class UserData:
         self._completed_requests = queue.Queue()
 
 
-def prepare_tensor(name, input, protocol):
-    client_util = httpclient if protocol == "http" else grpcclient
-    t = client_util.InferInput(name, input.shape,
-                               np_to_triton_dtype(input.dtype))
+def prepare_tensor(name, input):
+    t = grpcclient.InferInput(name, input.shape,
+                              np_to_triton_dtype(input.dtype))
     t.set_data_from_numpy(input)
     return t
 
 
-def prepare_inputs(input_ids_data, input_lengths_data, request_output_len_data,
-                   beam_width_data, temperature_data, streaming_data, end_id,
-                   pad_id):
-    protocol = 'grpc'
-    inputs = [
-        prepare_tensor("input_ids", input_ids_data, protocol),
-        prepare_tensor("input_lengths", input_lengths_data, protocol),
-        prepare_tensor("request_output_len", request_output_len_data,
-                       protocol),
-        prepare_tensor("beam_width", beam_width_data, protocol),
-        prepare_tensor("temperature", temperature_data, protocol),
-        prepare_tensor("streaming", streaming_data, protocol),
-        prepare_tensor("end_id", end_id, protocol),
-        prepare_tensor("pad_id", pad_id, protocol),
-    ]
+def prepare_outputs(output_names):
 
+    outputs = []
+    for output_name in output_names:
+        outputs.append(grpcclient.InferRequestedOutput(output_name))
+    return outputs
+
+
+def prepare_inputs(input_ids_data, input_lengths_data, request_output_len_data,
+                   beam_width_data, temperature_data, repetition_penalty_data,
+                   presence_penalty_data, streaming_data, end_id, pad_id,
+                   prompt_embedding_table_data, prompt_vocab_size_data,
+                   return_log_probs_data, top_k_data, top_p_data,
+                   draft_ids_data):
+    inputs = [
+        prepare_tensor("input_ids", input_ids_data),
+        prepare_tensor("input_lengths", input_lengths_data),
+        prepare_tensor("request_output_len", request_output_len_data),
+        prepare_tensor("beam_width", beam_width_data),
+        prepare_tensor("temperature", temperature_data),
+        prepare_tensor("streaming", streaming_data),
+        prepare_tensor("end_id", end_id),
+        prepare_tensor("pad_id", pad_id),
+        prepare_tensor("return_log_probs", return_log_probs_data),
+        prepare_tensor("runtime_top_k", top_k_data),
+        prepare_tensor("runtime_top_p", top_p_data),
+    ]
+    if prompt_embedding_table_data is not None:
+        inputs += [
+            prepare_tensor("prompt_embedding_table",
+                           prompt_embedding_table_data),
+            prepare_tensor("prompt_vocab_size", prompt_vocab_size_data)
+        ]
+    if repetition_penalty_data is not None:
+        inputs += [
+            prepare_tensor("repetition_penalty", repetition_penalty_data),
+        ]
+    if presence_penalty_data is not None:
+        inputs += [
+            prepare_tensor("presence_penalty", presence_penalty_data),
+        ]
+    if draft_ids_data is not None:
+        inputs += [
+            prepare_tensor("draft_input_ids", draft_ids_data),
+        ]
     return inputs
 
 
@@ -97,13 +160,13 @@ def prepare_stop_signals():
     inputs = [
         grpcclient.InferInput('input_ids', [1, 1], "INT32"),
         grpcclient.InferInput('input_lengths', [1, 1], "INT32"),
-        grpcclient.InferInput('request_output_len', [1, 1], "UINT32"),
+        grpcclient.InferInput('request_output_len', [1, 1], "INT32"),
         grpcclient.InferInput('stop', [1, 1], "BOOL"),
     ]
 
     inputs[0].set_data_from_numpy(np.empty([1, 1], dtype=np.int32))
     inputs[1].set_data_from_numpy(np.zeros([1, 1], dtype=np.int32))
-    inputs[2].set_data_from_numpy(np.array([[0]], dtype=np.uint32))
+    inputs[2].set_data_from_numpy(np.array([[0]], dtype=np.int32))
     inputs[3].set_data_from_numpy(np.array([[True]], dtype='bool'))
 
     return inputs
@@ -121,9 +184,11 @@ def callback(user_data, result, error):
         user_data._completed_requests.put(result)
         if (FLAGS.streaming):
             output_ids = result.as_numpy('output_ids')
+            seq_lens = result.as_numpy('sequence_length')
             if output_ids != None:
-                tokens = list(output_ids[0][0])
-                print(tokens, flush=True)
+                if seq_lens == None or seq_lens[0][0] > 0:
+                    tokens = list(output_ids[0][0])
+                    print(tokens, flush=True)
 
 
 if __name__ == "__main__":
@@ -150,6 +215,42 @@ if __name__ == "__main__":
         required=False,
         default='Born in north-east France, Soyer trained as a',
         help='Input text')
+
+    parser.add_argument('--input-tokens-csv',
+                        type=str,
+                        required=False,
+                        default='',
+                        help='Path to csv file containing the input tokens')
+
+    parser.add_argument('--draft-tokens-csv',
+                        type=str,
+                        required=False,
+                        default='',
+                        help='Path to csv file containing the draft tokens')
+
+    parser.add_argument(
+        '--output-tokens-csv',
+        type=str,
+        required=False,
+        default='',
+        help='Path to csv file containing the expected output tokens')
+
+    parser.add_argument(
+        '--end-id',
+        type=int,
+        required=False,
+        default=50256,
+        help='The token id for end token. Only needed if tokenizer is not used.'
+    )
+
+    parser.add_argument(
+        '--pad-id',
+        type=int,
+        required=False,
+        default=50256,
+        help='The token id for pad token. Only needed if tokenizer is not used.'
+    )
+
     parser.add_argument(
         "-s",
         "--ssl",
@@ -232,11 +333,26 @@ if __name__ == "__main__":
         help="temperature value",
     )
     parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        required=False,
+        default=None,
+        help="The repetition penalty value",
+    )
+    parser.add_argument(
+        "--presence-penalty",
+        type=float,
+        required=False,
+        default=None,
+        help="The presence penalty value",
+    )
+
+    parser.add_argument(
         "--request-output-len",
         type=int,
         required=False,
         default=16,
-        help="temperature value",
+        help="Request output length",
     )
     parser.add_argument(
         '--stop-after-ms',
@@ -244,80 +360,234 @@ if __name__ == "__main__":
         required=False,
         default=0,
         help='Early stop the generation after a few milliseconds')
-    parser.add_argument('--tokenizer_dir',
+    parser.add_argument(
+        "--stop-via-request-cancel",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Early stop use request cancellation instead of stop request")
+    parser.add_argument('--tokenizer-dir',
                         type=str,
-                        required=True,
+                        required=False,
+                        default='',
                         help='Specify tokenizer directory')
-    parser.add_argument('--tokenizer_type',
+    parser.add_argument('--tokenizer-type',
                         type=str,
                         default='auto',
                         required=False,
                         choices=['auto', 't5', 'llama'],
                         help='Specify tokenizer type')
-    parser.add_argument('--request_id',
+    parser.add_argument('--request-id',
                         type=str,
-                        default='1',
+                        default='',
                         required=False,
                         help='The request_id for the stop request')
 
+    parser.add_argument('--prompt-embedding-table-path',
+                        type=str,
+                        default='',
+                        required=False,
+                        help='The prompt embedding table to use for ptuning')
+    parser.add_argument(
+        "--exclude-input-in-output",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Expect that output IDs do not contain input IDs",
+    )
+
+    parser.add_argument(
+        '--prompt-task-id',
+        type=int,
+        default=0,
+        required=False,
+        help='The prompt task id in the prompt embedding table')
+
+    parser.add_argument('--dtype',
+                        type=str,
+                        default='float16',
+                        choices=['float16', 'float32', 'bfloat16'])
+
+    parser.add_argument(
+        "--return-log-probs",
+        action="store_true",
+        required=False,
+        default=False,
+        help="Enable computation of log probs",
+    )
+
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        required=False,
+        default=1,
+        help="top k value",
+    )
+
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        required=False,
+        default=0.,
+        help="top p value",
+    )
+
+    parser.add_argument('--requested-outputs',
+                        nargs='+',
+                        default=[],
+                        help='The requested output tensors')
+
     FLAGS = parser.parse_args()
 
-    print('=========')
-    if FLAGS.tokenizer_type == 't5':
-        tokenizer = T5Tokenizer(vocab_file=FLAGS.tokenizer_dir,
-                                padding_side='left')
-    elif FLAGS.tokenizer_type == 'auto':
-        tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_dir,
-                                                  padding_side='left')
-    elif FLAGS.tokenizer_type == 'llama':
-        tokenizer = LlamaTokenizer.from_pretrained(FLAGS.tokenizer_dir,
-                                                   legacy=False,
-                                                   padding_side='left')
-    else:
-        raise AttributeError(
-            f'Unexpected tokenizer type: {FLAGS.tokenizer_type}')
-    tokenizer.pad_token = tokenizer.eos_token
-    pad_id = tokenizer.encode(tokenizer.pad_token, add_special_tokens=False)[0]
-    end_id = tokenizer.encode(tokenizer.eos_token, add_special_tokens=False)[0]
-    end_id_data = np.array([[end_id]], dtype=np.uint32)
-    pad_id_data = np.array([[pad_id]], dtype=np.uint32)
+    tokenizer = None
+    draft_ids = None
+    if FLAGS.input_tokens_csv != "":
+        with open(FLAGS.input_tokens_csv) as csv_file:
+            csv_reader = csv.reader(csv_file, delimiter=",")
+            for row in csv_reader:
+                input_ids = [[int(val) for val in row]]
+                break
 
-    input_ids = [tokenizer.encode(FLAGS.text)]
+            curate_log_output(input_ids[0], "Input")
+
+        if FLAGS.draft_tokens_csv != "":
+            with open(FLAGS.draft_tokens_csv) as csv_file:
+                csv_reader = csv.reader(csv_file, delimiter=",")
+                for row in csv_reader:
+                    draft_ids = [[int(val) for val in row]]
+                    break
+
+        end_id = FLAGS.end_id
+        pad_id = FLAGS.pad_id
+
+    else:
+        print('=========')
+        if not os.path.exists(FLAGS.tokenizer_dir):
+            print(
+                "Input tokens are not provided and tokenizer directory does not exist: ",
+                FLAGS.tokenizer_dir)
+            exit()
+
+        if FLAGS.tokenizer_type == 't5':
+            tokenizer = T5Tokenizer(vocab_file=FLAGS.tokenizer_dir,
+                                    padding_side='left')
+        elif FLAGS.tokenizer_type == 'auto':
+            tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_dir,
+                                                      padding_side='left')
+        elif FLAGS.tokenizer_type == 'llama':
+            tokenizer = LlamaTokenizer.from_pretrained(FLAGS.tokenizer_dir,
+                                                       legacy=False,
+                                                       padding_side='left')
+        else:
+            raise AttributeError(
+                f'Unexpected tokenizer type: {FLAGS.tokenizer_type}')
+
+        tokenizer.pad_token = tokenizer.eos_token
+        pad_id = tokenizer.encode(tokenizer.pad_token,
+                                  add_special_tokens=False)[0]
+        end_id = tokenizer.encode(tokenizer.eos_token,
+                                  add_special_tokens=False)[0]
+
+        input_ids = [tokenizer.encode(FLAGS.text)]
+        curate_log_output(input_ids[0], "Input")
+
+    end_id_data = np.array([[end_id]], dtype=np.int32)
+    pad_id_data = np.array([[pad_id]], dtype=np.int32)
+
+    #Get the prompt embedding table for the task id
+    prompt_embedding_table_data = None
+    prompt_vocab_size_data = None
+    if (FLAGS.prompt_embedding_table_path != ""):
+        prompt_table = np.load(FLAGS.prompt_embedding_table_path)
+        prompt_table = prompt_table.astype(str_dtype_to_np(FLAGS.dtype))
+        task_vocab_size = prompt_table.shape[1]
+
+        # squeeze the first 2 dimensions
+        prompt_embedding_table_data = prompt_table[FLAGS.prompt_task_id]
+        prompt_embedding_table_data = np.expand_dims(
+            prompt_table[FLAGS.prompt_task_id], axis=0)
+
+        prompt_vocab_size = [[task_vocab_size]]
+        prompt_vocab_size_data = np.array(prompt_vocab_size, dtype=np.int32)
+
     input_ids_data = np.array(input_ids, dtype=np.int32)
     input_lengths = [[len(ii)] for ii in input_ids]
     input_lengths_data = np.array(input_lengths, dtype=np.int32)
     request_output_len = [[FLAGS.request_output_len]]
-    request_output_len_data = np.array(request_output_len, dtype=np.uint32)
+    request_output_len_data = np.array(request_output_len, dtype=np.int32)
     beam_width = [[FLAGS.beam_width]]
-    beam_width_data = np.array(beam_width, dtype=np.uint32)
+    beam_width_data = np.array(beam_width, dtype=np.int32)
+    top_k = [[FLAGS.top_k]]
+    top_k_data = np.array(top_k, dtype=np.int32)
+    top_p = [[FLAGS.top_p]]
+    top_p_data = np.array(top_p, dtype=np.float32)
     temperature = [[FLAGS.temperature]]
     temperature_data = np.array(temperature, dtype=np.float32)
+    return_log_probs = [[FLAGS.return_log_probs]]
+    return_log_probs_data = np.array(return_log_probs, dtype=bool)
+
+    repetition_penalty_data = None
+    if FLAGS.repetition_penalty is not None:
+        repetition_penalty = [[FLAGS.repetition_penalty]]
+        repetition_penalty_data = np.array(repetition_penalty,
+                                           dtype=np.float32)
+    presence_penalty_data = None
+    if FLAGS.presence_penalty is not None:
+        presence_penalty = [[FLAGS.presence_penalty]]
+        presence_penalty_data = np.array(presence_penalty, dtype=np.float32)
     streaming = [[FLAGS.streaming]]
     streaming_data = np.array(streaming, dtype=bool)
 
+    draft_ids_data = None
+    if draft_ids is not None:
+        draft_ids_data = np.array(draft_ids, dtype=np.int32)
+
     inputs = prepare_inputs(input_ids_data, input_lengths_data,
                             request_output_len_data, beam_width_data,
-                            temperature_data, streaming_data, end_id_data,
-                            pad_id_data)
+                            temperature_data, repetition_penalty_data,
+                            presence_penalty_data, streaming_data, end_id_data,
+                            pad_id_data, prompt_embedding_table_data,
+                            prompt_vocab_size_data, return_log_probs_data,
+                            top_k_data, top_p_data, draft_ids_data)
 
-    if FLAGS.stop_after_ms > 0:
-        stop_inputs = prepare_stop_signals()
+    if FLAGS.requested_outputs:
+        # Must have at least output_ids in requested outputs
+        if "output_ids" not in FLAGS.requested_outputs:
+            raise Exception(
+                "requested outputs must at least have \"output_ids\"")
+        outputs = prepare_outputs(FLAGS.requested_outputs)
     else:
-        stop_inputs = None
+        outputs = None
+
+    stop_inputs = None
+    if FLAGS.stop_after_ms > 0 and not FLAGS.stop_via_request_cancel:
+        stop_inputs = prepare_stop_signals()
 
     request_id = FLAGS.request_id
 
-    expected_output_ids = input_ids[0] + [
-        21221, 290, 257, 4255, 379, 262, 1957, 7072, 11, 4689, 347, 2852, 2564,
-        494, 13, 679
-    ]
+    if FLAGS.output_tokens_csv != "":
+        with open(FLAGS.output_tokens_csv) as csv_file:
+            csv_reader = csv.reader(csv_file, delimiter=",")
+            for row in csv_reader:
+                expected_output_ids = [int(val) for val in row]
+                break
+    else:
+        expected_output_ids = ([] if FLAGS.exclude_input_in_output else
+                               input_ids[0]) + [
+                                   21221, 290, 257, 4255, 379, 262, 1957, 7072,
+                                   11, 4689, 347, 2852, 2564, 494, 13, 679
+                               ]
 
     if FLAGS.streaming:
-        actual_output_ids = [input_ids[0]]
+        actual_output_ids = [
+            [] if FLAGS.exclude_input_in_output else input_ids[0]
+        ]
     else:
         actual_output_ids = []
 
     sequence_lengths = []
+    cum_log_probs = None
+    output_log_probs = None
 
     user_data = UserData()
     with grpcclient.InferenceServerClient(
@@ -341,21 +611,23 @@ if __name__ == "__main__":
                 triton_client.async_stream_infer(
                     'tensorrt_llm',
                     inputs,
+                    outputs=outputs,
                     request_id=request_id,
                 )
 
-                if stop_inputs is not None:
-
+                if FLAGS.stop_after_ms > 0:
                     time.sleep(FLAGS.stop_after_ms / 1000.0)
 
-                    triton_client.async_stream_infer(
-                        'tensorrt_llm',
-                        stop_inputs,
-                        request_id=request_id,
-                        parameters={'Streaming': FLAGS.streaming})
+                    if not FLAGS.stop_via_request_cancel:
+                        triton_client.async_stream_infer(
+                            'tensorrt_llm',
+                            stop_inputs,
+                            request_id=request_id,
+                            parameters={'Streaming': FLAGS.streaming})
 
-                #Wait for server to close the stream
-                triton_client.stop_stream()
+                # Close the grpc stream
+                cancel_requests = FLAGS.stop_after_ms > 0 and FLAGS.stop_via_request_cancel
+                triton_client.stop_stream(cancel_requests=cancel_requests)
 
                 # Parse the responses
                 while True:
@@ -365,40 +637,53 @@ if __name__ == "__main__":
                         break
 
                     if type(result) == InferenceServerException:
-                        print("Received an error from server:")
-                        print(result)
+                        if result.status() == "StatusCode.CANCELLED":
+                            print("Request is cancelled")
+                        else:
+                            print("Received an error from server:")
+                            print(result)
+                            raise result
                     else:
+                        check_output_names(FLAGS.requested_outputs, result)
                         output_ids = result.as_numpy('output_ids')
                         sequence_lengths = result.as_numpy('sequence_length')
                         if output_ids is not None:
                             # Only one beam is supported
-                            tokens = list(output_ids[0][0])
-                            actual_output_ids[
-                                0] = actual_output_ids[0] + tokens
+                            if sequence_lengths == None or sequence_lengths[0][
+                                    0] > 0:
+                                tokens = list(output_ids[0][0])
+                                actual_output_ids[
+                                    0] = actual_output_ids[0] + tokens
                         else:
                             print("Got cancellation response from server")
             else:
                 # Send request
-                triton_client.async_infer(
+                infer_future = triton_client.async_infer(
                     'tensorrt_llm',
                     inputs,
+                    outputs=outputs,
                     request_id=request_id,
                     callback=partial(callback, user_data),
                     parameters={'Streaming': FLAGS.streaming})
 
-                if stop_inputs is not None:
+                expected_responses = 1
+
+                if FLAGS.stop_after_ms > 0:
 
                     time.sleep(FLAGS.stop_after_ms / 1000.0)
 
-                    triton_client.async_infer(
-                        'tensorrt_llm',
-                        stop_inputs,
-                        request_id=request_id,
-                        callback=partial(callback, user_data),
-                        parameters={'Streaming': FLAGS.streaming})
+                    if FLAGS.stop_via_request_cancel:
+                        infer_future.cancel()
+                    else:
+                        triton_client.async_infer(
+                            'tensorrt_llm',
+                            stop_inputs,
+                            request_id=request_id,
+                            callback=partial(callback, user_data),
+                            parameters={'Streaming': FLAGS.streaming})
+                        expected_responses += 1
 
                 processed_count = 0
-                expected_responses = 1 + (1 if stop_inputs is not None else 0)
                 while processed_count < expected_responses:
                     try:
                         result = user_data._completed_requests.get()
@@ -407,11 +692,20 @@ if __name__ == "__main__":
                         break
 
                     if type(result) == InferenceServerException:
-                        print("Received an error from server:")
-                        print(result)
+                        if result.status() == "StatusCode.CANCELLED":
+                            print("Request is cancelled")
+                        else:
+                            print("Received an error from server:")
+                            print(result)
+                            raise result
                     else:
+                        check_output_names(FLAGS.requested_outputs, result)
                         output_ids = result.as_numpy('output_ids')
                         sequence_lengths = result.as_numpy('sequence_length')
+                        if (FLAGS.return_log_probs):
+                            cum_log_probs = result.as_numpy('cum_log_probs')
+                            output_log_probs = result.as_numpy(
+                                'output_log_probs')
                         if output_ids is not None:
                             for beam_output_ids in output_ids[0]:
                                 tokens = list(beam_output_ids)
@@ -421,26 +715,45 @@ if __name__ == "__main__":
 
                     processed_count = processed_count + 1
         except Exception as e:
-            print("channel creation failed: " + str(e))
-            sys.exit()
+            err = "Encountered error: " + str(e)
+            print(err)
+            sys.exit(err)
 
         passed = True
 
         for beam in range(FLAGS.beam_width):
-            seq_len = sequence_lengths[0][
-                beam] if not FLAGS.streaming else len(actual_output_ids[beam])
+            seq_len = sequence_lengths[0][beam] if (
+                not FLAGS.streaming and len(sequence_lengths) > 0) else len(
+                    actual_output_ids[beam])
+            # These should be equal when input IDs are excluded from output
             output_ids_w_prompt = actual_output_ids[beam][:seq_len]
-            output_ids_wo_prompt = output_ids_w_prompt[input_ids_data.
-                                                       shape[1]:]
-            output_text = tokenizer.decode(output_ids_wo_prompt)
-            print(f'Input: {FLAGS.text}')
-            print(f'Output beam {beam}: {output_text}')
+            output_ids_wo_prompt = (
+                output_ids_w_prompt if FLAGS.exclude_input_in_output else
+                output_ids_w_prompt[input_ids_data.shape[1]:])
+            if tokenizer != None:
+                output_text = tokenizer.decode(output_ids_wo_prompt)
+                print(f'Input: {FLAGS.text}')
+                print(f'Output beam {beam}: {output_text}')
+
+            # If cancelled, the number of output tokens should be less than request output length.
+            if FLAGS.stop_after_ms > 0 and len(
+                    output_ids_wo_prompt) >= FLAGS.request_output_len:
+                raise AssertionError("expect less than " +
+                                     str(FLAGS.request_output_len) +
+                                     " output tokens, got " +
+                                     str(len(output_ids_wo_prompt)))
+
+            curate_log_output(output_ids_w_prompt, "Output")
+
             if (FLAGS.check_output and beam == 0):
                 passed = (output_ids_w_prompt == expected_output_ids)
-                print("output_ids = ", output_ids_w_prompt)
                 print("expected_output_ids = ", expected_output_ids)
                 print("\n=====")
                 print("PASS!" if passed else "FAIL!")
                 print("=====")
+
+        if FLAGS.return_log_probs:
+            print(cum_log_probs)
+            print(output_log_probs)
 
         sys.exit(not passed)

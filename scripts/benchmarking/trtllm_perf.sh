@@ -1,14 +1,11 @@
 #!/usr/bin/bash
 
-MODEL=$1
+# MODEL_SPEC is defined as "MODEL_NAME,TP,PP"
+MODEL_SPEC=$1
+RECORD_SERVER_STATS="${2:-"false"}"
 
 TOKENIZER_DIR=/trt_llm_data/llm-models/llama-models/llama-7b-hf
 TOKENIZER_TYPE=llama
-
-GPT2=/trt_llm_data/llm-models/gpt2
-OPT_125M=/trt_llm_data/llm-models/opt-125m
-LLAMA=/trt_llm_data/llm-models/llama-models/llama-7b-hf
-GPTJ=/trt_llm_data/llm-models/gpt-j-6b
 
 set -e
 
@@ -19,132 +16,70 @@ script_dir=$(dirname "$(realpath "$0")")
 
 declare -A bs_dict
 if [[ $gpu_info == *"A100"* ]] ||  [[ $gpu_info == *"H100"* ]]; then
-    bs_dict["llama-7b-fp8"]=64
-    bs_dict["gptj-6b-fp8"]=96
-    bs_dict["llama-70b-fp8-tp2"]=64
-    bs_dict["llama-70b-fp8-tp4"]=128
-    bs_dict["falcon-180b-fp8-tp8"]=64
-elif [[ $gpu_info == *"A100"* ]]; then
-    bs_dict["llama-7b-fp8"]=32
-    bs_dict["gptj-6b-fp8"]=48
+    bs_dict["llama-7b-fp8,1,1"]=2048
+    bs_dict["llama-13b-fp8,1,1"]=2048
+    bs_dict["llama-7b-fp16,1,1"]=1024
+    bs_dict["mistral-7b-fp16,1,1"]=1024
+    bs_dict["llama-13b-fp16,1,1"]=1024
+    bs_dict["gptj-6b-fp8,1,1"]=96
+    bs_dict["llama-70b-fp8,2,1"]=512
+    bs_dict["llama-70b-fp8,4,1"]=1024
+    bs_dict["llama-70b-fp16,2,1"]=256
+    bs_dict["llama-70b-fp16,4,1"]=512
+    bs_dict["falcon-180b-fp8,8,1"]=512
+elif [[ $gpu_info == *"L40S"* ]]; then
+    bs_dict["llama-7b-fp8,1,1"]=1024
+    bs_dict["llama-13b-fp8,1,1"]=512
+    bs_dict["gptj-6b-fp8,1,1"]=48
 fi
 
-if [ -z "$MODEL" ]; then
-    echo "No model specified. Will run default list for the machine"
+MAX_TOKENS=100000
+
+if [ -z "$MODEL_SPEC" ]; then
+    echo "No model spec specified. Will run default list for the MACHINE"
+
     if [[ $gpu_info == *"A100"* ]]; then
-        model_list=(  "llama-7b-fp16" "gptj-6b-fp16" "llama-70b-fp16-tp4"  "falcon-180b-fp16-tp8" )
-        machine="a100"
+        MODEL_SPEC_LIST=(  "llama-7b-fp16,1,1" "mistral-7b-fp16,1,1" "llama-13b-fp16,1,1"  "gptj-6b-fp16,1,1" "llama-70b-fp16,4,1"  "falcon-180b-fp16,8,1" )
+        MACHINE="a100"
     elif [[ $gpu_info == *"H100"* ]]; then
-        model_list=(  "llama-7b-fp8" "llama-70b-fp8-tp4" ) # "gptj-6b-fp8" ) #"llama-70b-fp8-tp2" "falcon-180b-fp8-tp8" )
-        machine="h100"
+        MODEL_SPEC_LIST=( "llama-7b-fp8,1,1" "llama-13b-fp8,1,1" "llama-70b-fp8,4,1" "gptj-6b-fp8,1,1" "llama-70b-fp8,2,1" "falcon-180b-fp8,8,1" )
+        MACHINE="h100"
     elif [[ $gpu_info == *"L40S"* ]]; then
-        model_list=(  "llama-7b-fp8" "gptj-6b-fp8"  )
-        machine="l40s"
+        MODEL_SPEC_LIST=(  "llama-7b-fp8,1,1" "llama-13b-fp8,1,1" "gptj-6b-fp8,1,1"  )
+        MACHINE="l40s"
     else
-        echo -e "Nothing to run for this machine"
+        echo -e "Nothing to run for this MACHINE"
     fi
 else
-    echo "The selected model is: $MODEL"
+    MODEL_SPEC_LIST=( "$MODEL_SPEC" )
+    MACHINE="h100"
 fi
 
-for MODEL in "${model_list[@]}"; do
+for MODEL_SPEC in "${MODEL_SPEC_LIST[@]}"; do
 
-    BS="${bs_dict[$MODEL]}"
-    isl=2048
-    osl=512
+    IFS=',' read -ra MODEL_SPECS <<< "${MODEL_SPEC}"
+    MODEL=${MODEL_SPECS[0]}
+    TP=${MODEL_SPECS[1]}
+    PP=${MODEL_SPECS[2]}
+    WORLD_SIZE=$((TP*PP))
+
+    BS=${bs_dict[${MODEL_SPEC}]}
+    MAX_INPUT_SEQLEN=35000
+    MAX_OUTPUT_SEQLEN=10000
     if [[ $MODEL == *"gptj-6b"* ]]; then
-        isl=1535
+        MAX_INPUT_SEQLEN=1535
+        MAX_OUTPUT_SEQLEN=512
+    elif [[ $MODEL == *"mistral-7b"* ]]; then
+        MAX_INPUT_SEQLEN=32256
+        MAX_OUTPUT_SEQLEN=512
     fi
-    dir_name="bs${BS}_io_${isl}_${osl}"
+    DIR="bs${BS}_tokens${MAX_TOKENS}_tp${TP}_pp${PP}_isl${MAX_INPUT_SEQLEN}_osl${MAX_OUTPUT_SEQLEN}"
+    ENGINE_PATH=${script_dir}/../../tensorrt_llm/trt_engines/${MACHINE}/${MODEL}/${DIR}
 
-    if [ "$MODEL" = "llama-7b-fp8" ]; then
+    echo -e " \n ********  BUILDING $MODEL with TP=$TP PP=$PP  ************* \n"
+    bash build_model.sh $MODEL $ENGINE_PATH $BS  $MAX_INPUT_SEQLEN $MAX_OUTPUT_SEQLEN $MAX_TOKENS $TP $PP $WORLD_SIZE
 
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh llama-7b-fp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh llama-7b-fp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 1
-
-    fi
-
-    if [ "$MODEL" = "llama-7b-fp16" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh llama-7b-fp16 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh llama-7b-fp16 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 1
-
-    fi
-
-    if [ "$MODEL" = "llama-70b-fp8-tp2" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh llama-70b-fp8-tp2 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh llama-70b-fp8-tp2 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 2
-
-    fi
-
-    if [ "$MODEL" = "llama-70b-fp8-tp4" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh llama-70b-fp8-tp4 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh llama-70b-fp8-tp4 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 4
-
-    fi
-
-     if [ "$MODEL" = "llama-70b-fp16-tp4" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh llama-70b-fp16-tp4 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh llama-70b-fp16-tp4 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 4
-
-    fi
-
-    if [ "$MODEL" = "gptj-6b-fp8" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh gptj-6b-fp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh gptj-6b-fp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 1
-
-    fi
-
-    if [ "$MODEL" = "gptj-6b-fp16" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh gptj-6b-fp16 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh gptj-6b-fp16 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 1
-
-    fi
-
-    if [ "$MODEL" = "falcon-180b-fp8-tp8" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh falcon-180b-fp8-tp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh falcon-180b-fp8-tp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 8
-
-    fi
-
-     if [ "$MODEL" = "falcon-180b-fp16-tp8" ]; then
-
-        echo -e " \n ********  BUILDING $MODEL ************* \n"
-        bash build_model.sh falcon-180b-fp16-tp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $BS
-
-        echo -e " \n ******** RUNNING $MODEL *************** \n"
-        bash test.sh falcon-180b-fp16-tp8 ${script_dir}/../../tensorrt_llm/trt_engines/${machine}/${MODEL}/${dir_name} $TOKENIZER_DIR $TOKENIZER_TYPE $BS 8
-
-    fi
+    echo -e " \n ******** RUNNING $MODEL with TP=$TP PP=$PP  *************** \n"
+    bash test.sh $MODEL $ENGINE_PATH $TOKENIZER_DIR $TOKENIZER_TYPE $BS $MAX_INPUT_SEQLEN $WORLD_SIZE $RECORD_SERVER_STATS
 
 done
