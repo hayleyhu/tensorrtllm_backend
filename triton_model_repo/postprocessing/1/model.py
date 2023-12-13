@@ -166,8 +166,11 @@ class TritonPythonModel:
     def _postprocessing(self, tokens_batch, sequence_lengths):
         outputs = []
         for batch_idx, beam_tokens in enumerate(tokens_batch):
-            for beam_idx, tokens in enumerate(beam_tokens):
+            for beam_idx, output_id in enumerate(beam_tokens):
                 seq_len = sequence_lengths[batch_idx][beam_idx]
-                output = self.tokenizer.decode(tokens[:seq_len])
+                output = self.tokenizer.decode(output_id[:seq_len])
+                token = self.tokenizer.convert_ids_to_tokens(output_id)[0]
+                if token.startswith("▁"):
+                    output = " " + output
                 outputs.append(output.encode('utf8'))
         return outputs
